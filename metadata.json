@@ -1,0 +1,6 @@
+{
+  "name": "Couple Shopping List",
+  "description": "Real-time collaborative shopping lists with a live bill calculator and integrated chat for couples.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
