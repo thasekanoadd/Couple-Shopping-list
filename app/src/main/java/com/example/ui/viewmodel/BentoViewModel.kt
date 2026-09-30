@@ -494,9 +494,21 @@ class BentoViewModel(application: Application) : AndroidViewModel(application) {
             _scannedItems.value = emptyList()
 
             try {
-                // Convert bitmap to Base64
+                // Resize bitmap to max 1024x1024 to save memory, tokens and prevent rate limit (429) errors
+                val scaledBitmap = if (bitmap.width > 1024 || bitmap.height > 1024) {
+                    val ratio = bitmap.width.toFloat() / bitmap.height.toFloat()
+                    val (w, h) = if (ratio > 1f) {
+                        1024 to (1024 / ratio).toInt()
+                    } else {
+                        (1024 * ratio).toInt() to 1024
+                    }
+                    Bitmap.createScaledBitmap(bitmap, w, h, true)
+                } else {
+                    bitmap
+                }
+
                 val outputStream = java.io.ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 80, outputStream)
+                scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 80, outputStream)
                 val base64Data = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
 
                 val prompt = """
@@ -533,41 +545,280 @@ class BentoViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 )
 
-                // Use gemini-2.5-flash-image which supports multimodal and is fast
-                val response = GeminiRetrofitClient.service.generateContent(
-                    model = "gemini-2.5-flash-image",
-                    apiKey = apiKey,
-                    request = request
-                )
+                // Try modern models with fallback
+                val candidateModels = listOf("gemini-3.5-flash", "gemini-3.1-flash-lite-preview", "gemini-flash-latest")
+                var parsedList: List<ParsedShoppingItem>? = null
+                var lastError: Exception? = null
 
-                val textResponse = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-                if (!textResponse.isNullOrBlank()) {
-                    val parsedList = mutableListOf<ParsedShoppingItem>()
+                for (modelName in candidateModels) {
                     try {
-                        val jsonArray = org.json.JSONArray(textResponse)
-                        for (i in 0 until jsonArray.length()) {
-                            val obj = jsonArray.getJSONObject(i)
-                            val name = obj.optString("name", "").trim()
-                            val qty = obj.optString("qty", "").trim()
-                            if (name.isNotBlank()) {
-                                parsedList.add(ParsedShoppingItem(name = name, qty = qty))
+                        val response = GeminiRetrofitClient.service.generateContent(
+                            model = modelName,
+                            apiKey = apiKey,
+                            request = request
+                        )
+                        val textResponse = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                        if (!textResponse.isNullOrBlank()) {
+                            val items = mutableListOf<ParsedShoppingItem>()
+                            val jsonArray = org.json.JSONArray(textResponse)
+                            for (i in 0 until jsonArray.length()) {
+                                val obj = jsonArray.getJSONObject(i)
+                                val name = obj.optString("name", "").trim()
+                                val qty = obj.optString("qty", "").trim()
+                                if (name.isNotBlank()) {
+                                    items.add(ParsedShoppingItem(name = name, qty = if (qty.isEmpty()) "1" else qty))
+                                }
+                            }
+                            if (items.isNotEmpty()) {
+                                parsedList = items
+                                break
                             }
                         }
-                        if (parsedList.isEmpty()) {
-                            _scanError.value = "Δεν βρέθηκαν προϊόντα στην εικόνα. Δοκιμάστε ξανά με πιο καθαρή φωτογραφία."
-                        } else {
-                            _scannedItems.value = parsedList
-                        }
-                    } catch (jsonEx: Exception) {
-                        Log.e("BentoAI", "JSON parsing error: $textResponse", jsonEx)
-                        _scanError.value = "Σφάλμα κατά την ανάλυση των αποτελεσμάτων του AI. Δοκιμάστε ξανά."
+                    } catch (e: Exception) {
+                        lastError = e
+                        Log.w("BentoAI", "Model $modelName failed: ${e.message}")
                     }
+                }
+
+                if (parsedList != null && parsedList.isNotEmpty()) {
+                    _scannedItems.value = parsedList
+                    _scanError.value = null
                 } else {
-                    _scanError.value = "Το AI δεν επέστρεψε αποτελέσματα. Παρακαλώ δοκιμάστε ξανά."
+                    val errMsg = lastError?.message ?: ""
+                    if (errMsg.contains("429") || (lastError is retrofit2.HttpException && lastError.code() == 429)) {
+                        _scanError.value = "Σφάλμα AI (HTTP 429 - Rate Limit): Εξαντλήθηκε προσωρινά το όριο του AI. Χρησιμοποιήστε την καρτέλα «Επικόλληση Κειμένου» για άμεση εισαγωγή!"
+                    } else if (lastError != null) {
+                        _scanError.value = "Σφάλμα AI: ${lastError.localizedMessage ?: lastError.message}. Μπορείτε να εισάγετε τα προϊόντα και με «Επικόλληση Κειμένου»."
+                    } else {
+                        _scanError.value = "Δεν βρέθηκαν προϊόντα στην εικόνα. Δοκιμάστε ξανά ή χρησιμοποιήστε την «Επικόλληση Κειμένου»."
+                    }
                 }
             } catch (e: Exception) {
                 Log.e("BentoAI", "Scan api error", e)
-                _scanError.value = "Σφάλμα επικοινωνίας με το AI: ${e.localizedMessage ?: e.message}"
+                if (e.message?.contains("429") == true || (e is retrofit2.HttpException && e.code() == 429)) {
+                    _scanError.value = "Σφάλμα AI (HTTP 429 - Rate Limit): Εξαντλήθηκε προσωρινά το όριο του AI. Χρησιμοποιήστε την καρτέλα «Επικόλληση Κειμένου» για άμεση εισαγωγή!"
+                } else {
+                    _scanError.value = "Σφάλμα επικοινωνίας με το AI: ${e.localizedMessage ?: e.message}"
+                }
+            } finally {
+                _isScanning.value = false
+            }
+        }
+    }
+
+    /**
+     * Converts common Greek number words into numeric strings or standardizes them.
+     */
+    private val greekNumberWords = mapOf(
+        "ένα" to "1", "ένας" to "1", "μία" to "1", "μια" to "1",
+        "δύο" to "2", "δυο" to "2",
+        "τρία" to "3", "τρεις" to "3",
+        "τέσσερα" to "4", "τέσσερις" to "4",
+        "πέντε" to "5",
+        "έξι" to "6",
+        "επτά" to "7", "εφτά" to "7",
+        "οκτώ" to "8", "οχτώ" to "8",
+        "εννέα" to "9", "εννιά" to "9",
+        "δέκα" to "10",
+        "έντεκα" to "11",
+        "δώδεκα" to "12",
+        "δεκαπέντε" to "15",
+        "είκοσι" to "20",
+        "μισό" to "0.5", "μισή" to "0.5"
+    )
+
+    /**
+     * Splits continuous spoken Greek text (from Android SpeechRecognizer which does NOT insert punctuation)
+     * into separate shopping items using:
+     * - Spoken punctuation words ("κόμμα", "τελεία", "παύλα", "enter", "newline")
+     * - Spoken conjunctions ("και", "κι", "επίσης", "ακόμα", "ακόμη", "μετά")
+     * - Transition boundaries before quantities/numbers (e.g. "ψωμί 2 γάλατα" -> "ψωμί", "2 γάλατα")
+     * - Known units and packaging (κιλά, κιλό, kg, γρ, γραμμάρια, λίτρα, λίτρο, κουτιά, πακέτα, κτλ.)
+     */
+    fun splitSpokenGreekList(rawText: String): List<String> {
+        if (rawText.isBlank()) return emptyList()
+
+        var text = rawText.trim()
+
+        // 1. Convert spoken punctuation words to real delimiters
+        // People often say "κόμμα" or "τελεία" or the engine might output commas
+        text = text.replace(Regex("\\s*\\b(?:κόμμα|κομμα|τελεία|τελεια|παύλα|παυλα|άνω τελεία)\\b\\s*", RegexOption.IGNORE_CASE), " , ")
+
+        // 2. Convert spoken conjunctions to commas
+        text = text.replace(Regex("\\s*\\b(?:και|κι|επίσης|επισης|ακόμα|ακομα|ακόμη|ακομη|μετά|μετα)\\b\\s*", RegexOption.IGNORE_CASE), " , ")
+
+        // 3. Pre-process numbers written as Greek words before nouns or units
+        // e.g. "δύο γάλατα" -> "2 γάλατα", "τρία κιλά μήλα" -> "3 κιλά μήλα"
+        for ((word, digit) in greekNumberWords) {
+            text = text.replace(Regex("\\b$word\\b", RegexOption.IGNORE_CASE), digit)
+        }
+
+        // 4. Handle speech engine missing punctuation between items where a new number starts:
+        // e.g. "γάλα 2 ψωμιά 1 κιλό μήλα 500 γρ κιμά φέτα"
+        // Insert a delimiter before numbers that follow a non-number word (e.g. "γάλα | 2 ψωμιά | 1 κιλό...")
+        // But NOT inside quantities like "1.5" or "1 , 5"
+        val numberFollowsWordRegex = Regex("(?<=[^\\d\\s,;\\n])\\s+(?=\\d+(?:[.,]\\d+)?\\s*(?:κιλά|κιλό|kg|g|γρ|γραμμάρια|τεμ|τεμάχια|κουτί|κουτιά|πακέτο|πακέτα|λίτρα|λίτρο|l|ml)?\\s+[a-zA-Z\\u0370-\\u03FF])", RegexOption.IGNORE_CASE)
+        text = text.replace(numberFollowsWordRegex, " , ")
+
+        // 5. Split by all delimiters (commas, semicolons, newlines, etc.)
+        val parts = text.split(Regex("[,;\\n]+"))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+
+        return parts
+    }
+
+    /**
+     * Parses shopping list text locally without needing any API or internet connection.
+     * Extracts item names and quantities accurately (e.g. "2 γάλα", "ψωμί 1", "1.5 κιλό πατάτες", "φέτα 500γρ").
+     */
+    fun parseShoppingListTextLocally(rawText: String): List<ParsedShoppingItem> {
+        if (rawText.isBlank()) return emptyList()
+
+        val rawLines = splitSpokenGreekList(rawText)
+
+        val results = mutableListOf<ParsedShoppingItem>()
+        for (entry in rawLines) {
+            var clean = entry.trim()
+            if (clean.isBlank()) continue
+
+            // Remove leading bullets, numbers, checkmarks, dashes, brackets: e.g. "- γάλα", "* 2 ψωμιά", "1. αυγά", "[ ] μπανάνες"
+            clean = clean.replace(Regex("^([\\s\\-•*–—\\[\\]\\(xX\\)]|\\d+[.)])+\\s*"), "").trim()
+            if (clean.isBlank()) continue
+
+            // 1. Leading quantity pattern: e.g. "2 γάλα", "2x γάλα", "1.5 κιλό πατάτες", "500 γρ κιμάς", "6 αυγά"
+            val leadingRegex = Regex("^(\\d+(?:[.,]\\d+)?\\s*(?:κιλά|κιλό|kg|g|γρ|γραμμάρια|τεμ|τεμάχια|τεμ\\.|κουτί|κουτιά|πακέτο|πακέτα|λίτρα|λίτρο|l|ml)?(?:\\s*[xX*])?)\\s+(.+)$", RegexOption.IGNORE_CASE)
+            val leadMatch = leadingRegex.find(clean)
+            if (leadMatch != null) {
+                val qty = leadMatch.groupValues[1].trim()
+                val name = leadMatch.groupValues[2].trim()
+                if (name.isNotBlank()) {
+                    results.add(ParsedShoppingItem(name = name, qty = qty))
+                    continue
+                }
+            }
+
+            // 2. Trailing quantity pattern: e.g. "γάλα 2", "πατάτες 2 κιλά", "φέτα 500γρ", "μπύρες 6αδα"
+            val trailRegex = Regex("^(.+?)\\s+([xX*]?\\s*\\d+(?:[.,]\\d+)?\\s*(?:κιλά|κιλό|kg|g|γρ|γραμμάρια|τεμ|τεμάχια|τεμ\\.|κουτί|κουτιά|πακέτο|πακέτα|λίτρα|λίτρο|l|ml|αδα)?)$", RegexOption.IGNORE_CASE)
+            val trailMatch = trailRegex.find(clean)
+            if (trailMatch != null) {
+                val name = trailMatch.groupValues[1].trim()
+                val qty = trailMatch.groupValues[2].trim()
+                if (name.isNotBlank()) {
+                    results.add(ParsedShoppingItem(name = name, qty = qty))
+                    continue
+                }
+            }
+
+            // 3. Fallback: single item without specific quantity
+            results.add(ParsedShoppingItem(name = clean, qty = "1"))
+        }
+        return results
+    }
+
+    /**
+     * Imports shopping items from pasted raw text.
+     * If useAi is false, performs instant, offline local parsing (zero 429 errors).
+     * If useAi is true, attempts Gemini parsing and falls back automatically to local parsing on any error/429.
+     */
+    fun importFromPastedText(text: String, useAi: Boolean = false) {
+        if (text.isBlank()) return
+
+        val localItems = parseShoppingListTextLocally(text)
+        if (localItems.isEmpty()) {
+            _scanError.value = "Δεν εντοπίστηκαν προϊόντα στο κείμενο."
+            return
+        }
+
+        if (!useAi) {
+            _scannedItems.value = localItems
+            _scanError.value = null
+            return
+        }
+
+        // Use AI with automatic local fallback
+        viewModelScope.launch {
+            _isScanning.value = true
+            _scanError.value = null
+
+            val apiKey = com.example.BuildConfig.GEMINI_API_KEY
+            if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY") {
+                _scannedItems.value = localItems
+                _isScanning.value = false
+                return@launch
+            }
+
+            try {
+                val prompt = """
+                    You are an expert shopping list organizer.
+                    Extract each shopping item from this user text:
+                    $text
+
+                    For each item extract:
+                    - "name": clean product name in Greek (capitalize nicely)
+                    - "qty": quantity or weight (e.g. "1", "2 κιλά", "500γρ")
+
+                    Respond ONLY with a JSON array where each item has "name" and "qty". No markdown formatting.
+                """.trimIndent()
+
+                val request = GenerateContentRequest(
+                    contents = listOf(Content(parts = listOf(Part(text = prompt)))),
+                    generationConfig = GenerationConfig(
+                        responseMimeType = "application/json",
+                        temperature = 0.2f
+                    )
+                )
+
+                val candidateModels = listOf("gemini-3.5-flash", "gemini-3.1-flash-lite-preview", "gemini-flash-latest")
+                var parsedList: List<ParsedShoppingItem>? = null
+                var lastEx: Exception? = null
+
+                for (modelName in candidateModels) {
+                    try {
+                        val response = GeminiRetrofitClient.service.generateContent(
+                            model = modelName,
+                            apiKey = apiKey,
+                            request = request
+                        )
+                        val textResponse = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
+                        if (!textResponse.isNullOrBlank()) {
+                            val items = mutableListOf<ParsedShoppingItem>()
+                            val jsonArray = org.json.JSONArray(textResponse)
+                            for (i in 0 until jsonArray.length()) {
+                                val obj = jsonArray.getJSONObject(i)
+                                val name = obj.optString("name", "").trim()
+                                val qty = obj.optString("qty", "1").trim()
+                                if (name.isNotBlank()) {
+                                    items.add(ParsedShoppingItem(name = name, qty = if (qty.isEmpty()) "1" else qty))
+                                }
+                            }
+                            if (items.isNotEmpty()) {
+                                parsedList = items
+                                break
+                            }
+                        }
+                    } catch (e: Exception) {
+                        lastEx = e
+                        Log.w("BentoAI", "Model $modelName text import failed: ${e.message}")
+                    }
+                }
+
+                if (parsedList != null && parsedList.isNotEmpty()) {
+                    _scannedItems.value = parsedList
+                    _scanError.value = null
+                } else {
+                    // Fallback to local parsing gracefully
+                    _scannedItems.value = localItems
+                    if (lastEx?.message?.contains("429") == true || (lastEx is retrofit2.HttpException && lastEx.code() == 429)) {
+                        _scanError.value = "Σημείωση AI (429 Rate Limit): Έγινε αυτόματη τοπική ανάλυση κειμένου ✓"
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("BentoAI", "AI text parsing error", e)
+                _scannedItems.value = localItems
+                if (e.message?.contains("429") == true || (e is retrofit2.HttpException && e.code() == 429)) {
+                    _scanError.value = "Σημείωση AI (429 Rate Limit): Έγινε αυτόματη τοπική ανάλυση κειμένου ✓"
+                }
             } finally {
                 _isScanning.value = false
             }
@@ -592,6 +843,63 @@ class BentoViewModel(application: Application) : AndroidViewModel(application) {
             }
             clearScannedItems()
         }
+    }
+
+    /**
+     * Adds items spoken by the user via microphone speech recognition.
+     * Uses local parser - NO AI, 100% offline and instant.
+     * e.g., "ψωμί ολικής" -> name="ψωμί ολικής", qty="1"
+     * e.g., "2 γάλατα και 1 κιλό μήλα" -> 2 items parsed and added.
+     */
+    fun addVoiceSpokenItems(spokenText: String, targetListId: String? = null): List<String> {
+        val targetId = if (targetListId != null && targetListId != "all") {
+            targetListId
+        } else if (_selectedListId.value != "all") {
+            _selectedListId.value
+        } else {
+            allLists.value.firstOrNull()?.id ?: "default"
+        }
+
+        // Clean and parse text locally
+        var text = spokenText.trim()
+        // Support speaking multiple items connected by "και" or commas
+        text = text.replace(Regex("\\s+και\\s+", RegexOption.IGNORE_CASE), "\n")
+        val parsed = parseShoppingListTextLocally(text)
+        val addedNames = mutableListOf<String>()
+
+        if (parsed.isNotEmpty()) {
+            viewModelScope.launch {
+                parsed.forEach { item ->
+                    // Capitalize first letter of item name nicely
+                    val formattedName = item.name.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                    repository.addOrUpdateItem(
+                        id = null,
+                        name = formattedName,
+                        qty = item.qty,
+                        price = null,
+                        listIds = listOf(targetId),
+                        bought = false,
+                        priority = "LOW"
+                    )
+                    addedNames.add("$formattedName (${item.qty})")
+                }
+            }
+        } else if (text.isNotBlank()) {
+            val formattedName = text.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+            viewModelScope.launch {
+                repository.addOrUpdateItem(
+                    id = null,
+                    name = formattedName,
+                    qty = "1",
+                    price = null,
+                    listIds = listOf(targetId),
+                    bought = false,
+                    priority = "LOW"
+                )
+            }
+            addedNames.add(formattedName)
+        }
+        return addedNames
     }
 }
 

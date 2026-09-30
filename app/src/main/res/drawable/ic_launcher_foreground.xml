@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item
-        android:width="85dp"
-        android:height="85dp"
-        android:drawable="@drawable/img_app_icon_1781633851953"
+        android:width="78dp"
+        android:height="78dp"
+        android:drawable="@drawable/ic_launcher_custom_fg"
         android:gravity="center" />
 </layer-list>
 

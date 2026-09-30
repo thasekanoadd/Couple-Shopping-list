@@ -21,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -41,6 +42,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.IntOffset
 import kotlin.math.roundToInt
@@ -56,6 +58,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.PickVisualMediaRequest
 import coil.compose.AsyncImage
 import android.util.Log
+import android.content.Intent
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+import java.util.Locale
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -93,7 +104,7 @@ fun ConnectScreen(viewModel: BentoViewModel) {
     var inputServerUrl by remember { mutableStateOf(viewModel.wsServerUrl) }
     var isAdvancedExpanded by remember { mutableStateOf(false) }
 
-    val logoPainter = painterResource(id = R.drawable.couple_launcher_icon_1781631033821)
+    val logoPainter = painterResource(id = R.drawable.ic_launcher_custom_fg)
 
     Box(
         modifier = Modifier
@@ -122,17 +133,17 @@ fun ConnectScreen(viewModel: BentoViewModel) {
             // Elegant Bento Styled Logo Card
             Card(
                 modifier = Modifier
-                    .size(110.dp)
-                    .shadow(8.dp, RoundedCornerShape(24.dp)),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                    .size(130.dp)
+                    .shadow(10.dp, RoundedCornerShape(28.dp)),
+                shape = RoundedCornerShape(28.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFCFAED))
             ) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Image(
                         painter = logoPainter,
-                        contentDescription = "Bento Logo",
+                        contentDescription = "Couple Shopping List Logo",
                         modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Crop
+                        contentScale = ContentScale.Fit
                     )
                 }
             }
@@ -354,6 +365,7 @@ fun DashboardScreen(viewModel: BentoViewModel) {
     var showAiScanDialog by remember { mutableStateOf(false) }
     var selectedImageUri by remember { mutableStateOf<android.net.Uri?>(null) }
     var selectedImageBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var importDialogTab by remember { mutableStateOf(0) }
 
     val imagePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -393,6 +405,182 @@ fun DashboardScreen(viewModel: BentoViewModel) {
     var listToRename by remember { mutableStateOf<ShoppingList?>(null) }
     var listToDelete by remember { mutableStateOf<ShoppingList?>(null) }
     var checkingItemForCost by remember { mutableStateOf<ShoppingItem?>(null) }
+
+    // -------------------------------------------------------------
+    // 🎙️ VOICE INPUT / SPEECH RECOGNITION (NO AI - 100% OFFLINE / LOCAL)
+    // -------------------------------------------------------------
+    var isVoiceRecording by remember { mutableStateOf(false) }
+    var voiceRecognizedText by remember { mutableStateOf("") }
+    var isSpeechRecognizerAvailable by remember {
+        mutableStateOf(SpeechRecognizer.isRecognitionAvailable(context))
+    }
+    var speechRecognizer by remember { mutableStateOf<SpeechRecognizer?>(null) }
+    var voiceRmsLevel by remember { mutableStateOf(0f) }
+
+    // Initialize or release SpeechRecognizer with Lifecycle
+    DisposableEffect(Unit) {
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
+            speechRecognizer = recognizer
+        }
+        onDispose {
+            speechRecognizer?.destroy()
+            speechRecognizer = null
+        }
+    }
+
+    val speechRecognizerIntentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
+            val matches = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            val spoken = matches?.firstOrNull()
+            if (!spoken.isNullOrBlank()) {
+                voiceRecognizedText = spoken
+                val added = viewModel.addVoiceSpokenItems(spoken, selectedListId)
+                if (added.isNotEmpty()) {
+                    Toast.makeText(context, "Προστέθηκε: ${added.joinToString(", ")} ✨", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    val recordAudioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            Toast.makeText(context, "Απαιτείται άδεια μικροφώνου για φωνητική προσθήκη", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(context, "Άδεια μικροφώνου δόθηκε! Κρατήστε πατημένο το μικρόφωνο για να μιλήσετε 🎙️", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // Function to start speech recognition
+    fun startVoiceListening() {
+        val hasPermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (!hasPermission) {
+            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+
+        val recognizer = speechRecognizer ?: run {
+            val newRec = SpeechRecognizer.createSpeechRecognizer(context)
+            speechRecognizer = newRec
+            newRec
+        }
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "el-GR")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "el-GR")
+            putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, "el-GR")
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            // Allow user to speak a continuous list without cutting off too fast
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Πείτε τη λίστα σας (π.χ. γάλα, ψωμί, 2 μήλα και τυρί)...")
+        }
+
+        voiceRecognizedText = ""
+        voiceRmsLevel = 0f
+        isVoiceRecording = true
+
+        recognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                isVoiceRecording = true
+            }
+
+            override fun onBeginningOfSpeech() {
+                isVoiceRecording = true
+            }
+
+            override fun onRmsChanged(rmsdB: Float) {
+                voiceRmsLevel = rmsdB
+            }
+
+            override fun onBufferReceived(buffer: ByteArray?) {}
+
+            override fun onEndOfSpeech() {
+                // Speech ended
+            }
+
+            override fun onError(error: Int) {
+                isVoiceRecording = false
+                voiceRmsLevel = 0f
+                val message = when (error) {
+                    SpeechRecognizer.ERROR_AUDIO -> "Σφάλμα ήχου"
+                    SpeechRecognizer.ERROR_CLIENT -> "Σφάλμα εφαρμογής"
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Απαιτείται άδεια μικροφώνου"
+                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Σφάλμα σύνδεσης"
+                    SpeechRecognizer.ERROR_NO_MATCH -> "Δεν αναγνωρίστηκε ομιλία. Δοκιμάστε ξανά."
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Ο αναγνωριστής είναι απασχολημένος"
+                    SpeechRecognizer.ERROR_SERVER -> "Σφάλμα διακομιστή ομιλίας"
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Δεν ακούστηκε ομιλία"
+                    else -> "Σφάλμα φωνής ($error)"
+                }
+                if (error != SpeechRecognizer.ERROR_NO_MATCH && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            override fun onResults(results: Bundle?) {
+                isVoiceRecording = false
+                voiceRmsLevel = 0f
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val recognized = matches?.firstOrNull() ?: voiceRecognizedText
+                if (!recognized.isNullOrBlank()) {
+                    voiceRecognizedText = recognized
+                    val added = viewModel.addVoiceSpokenItems(recognized, selectedListId)
+                    if (added.isNotEmpty()) {
+                        Toast.makeText(
+                            context,
+                            "Προστέθηκε: ${added.joinToString(", ")} ✨",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val partial = matches?.firstOrNull()
+                if (!partial.isNullOrBlank()) {
+                    voiceRecognizedText = partial
+                }
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+
+        try {
+            recognizer.startListening(intent)
+        } catch (e: Exception) {
+            Log.e("BentoVoice", "Failed to start speech listening via SpeechRecognizer, trying intent", e)
+            isVoiceRecording = false
+            try {
+                speechRecognizerIntentLauncher.launch(intent)
+            } catch (ex: Exception) {
+                Log.e("BentoVoice", "Failed to launch speech intent", ex)
+                Toast.makeText(context, "Δεν βρέθηκε υπηρεσία αναγνώρισης φωνής στη συσκευή", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    // Function to stop speech recognition and process results
+    fun stopVoiceListening() {
+        if (isVoiceRecording) {
+            try {
+                speechRecognizer?.stopListening()
+            } catch (e: Exception) {
+                Log.e("BentoVoice", "Error stopping speech listening", e)
+            }
+        }
+    }
 
     // Multi-selection state
     var selectedItemIds by remember { mutableStateOf(setOf<String>()) }
@@ -604,6 +792,23 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                                 }
                             }
 
+                            // Quick Import / Text Paste Button
+                            IconButton(
+                                onClick = {
+                                    importDialogTab = 1
+                                    showAiScanDialog = true
+                                },
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .testTag("top_bar_import_btn")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ContentPaste,
+                                    contentDescription = "Εισαγωγή Προϊόντων",
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+
                             // Settings Icon
                             IconButton(
                                 onClick = { showSettingsDialog = true },
@@ -770,11 +975,9 @@ fun DashboardScreen(viewModel: BentoViewModel) {
             }
         },
         floatingActionButton = {
-            FloatingActionButton(
-                onClick = { showAddItemDialog = true },
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = Color.White,
-                shape = RoundedCornerShape(16.dp),
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(14.dp),
                 modifier = Modifier
                     .offset { IntOffset(fabOffset.x.roundToInt(), fabOffset.y.roundToInt()) }
                     .pointerInput(Unit) {
@@ -786,9 +989,80 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                             )
                         }
                     }
-                    .testTag("add_item_fab")
             ) {
-                Icon(Icons.Default.Add, "Add Item", modifier = Modifier.size(24.dp))
+                // 1. 🎙️ Floating Microphone Button (Click to start/stop listening, auto-adds whole list without AI)
+                val micScale by animateFloatAsState(
+                    targetValue = if (isVoiceRecording) 1.25f else 1.0f,
+                    animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
+                    label = "mic_scale"
+                )
+                val micPulseInfinite = rememberInfiniteTransition(label = "mic_pulse")
+                val micPulseAlpha by micPulseInfinite.animateFloat(
+                    initialValue = 0.35f,
+                    targetValue = 0.95f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(600, easing = FastOutSlowInEasing),
+                        repeatMode = RepeatMode.Reverse
+                    ),
+                    label = "pulse_alpha"
+                )
+
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier.size(68.dp)
+                ) {
+                    // Pulsing wave halo when actively listening
+                    if (isVoiceRecording) {
+                        Box(
+                            modifier = Modifier
+                                .size(68.dp)
+                                .scale(micScale)
+                                .background(
+                                    Color(0xFFEF4444).copy(alpha = micPulseAlpha * 0.35f),
+                                    CircleShape
+                                )
+                        )
+                    }
+
+                    FloatingActionButton(
+                        onClick = {
+                            if (!isVoiceRecording) {
+                                startVoiceListening()
+                            } else {
+                                stopVoiceListening()
+                            }
+                        },
+                        shape = CircleShape,
+                        containerColor = if (isVoiceRecording) Color(0xFFEF4444) else MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = if (isVoiceRecording) Color.White else MaterialTheme.colorScheme.onSecondaryContainer,
+                        elevation = FloatingActionButtonDefaults.elevation(
+                            defaultElevation = if (isVoiceRecording) 10.dp else 4.dp,
+                            pressedElevation = 12.dp
+                        ),
+                        modifier = Modifier
+                            .size(56.dp)
+                            .scale(micScale)
+                            .testTag("voice_mic_fab")
+                    ) {
+                        Icon(
+                            imageVector = if (isVoiceRecording) Icons.Default.Mic else Icons.Default.MicNone,
+                            contentDescription = "Φωνητική Προσθήκη Λίστας (Πατήστε για έναρξη/διακοπή)",
+                            tint = if (isVoiceRecording) Color.White else MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+                }
+
+                // 2. Standard Add Item FAB (+)
+                FloatingActionButton(
+                    onClick = { showAddItemDialog = true },
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = Color.White,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.testTag("add_item_fab")
+                ) {
+                    Icon(Icons.Default.Add, "Add Item", modifier = Modifier.size(24.dp))
+                }
             }
         }
     ) { innerPadding ->
@@ -1106,6 +1380,84 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                     }
                 }
             }
+
+            // 🎙️ Voice Recording Active Visual Banner
+            AnimatedVisibility(
+                visible = isVoiceRecording,
+                enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
+                exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 }),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 80.dp, start = 20.dp, end = 20.dp)
+            ) {
+                Card(
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceColorAtElevation(6.dp)
+                    ),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
+                    border = BorderStroke(1.5.dp, Color(0xFFEF4444).copy(alpha = 0.6f)),
+                    modifier = Modifier
+                        .fillMaxWidth(0.92f)
+                        .testTag("voice_listening_overlay")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .background(Color(0xFFEF4444).copy(alpha = 0.15f), CircleShape)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Mic,
+                                    contentDescription = "Ακρόαση",
+                                    tint = Color(0xFFEF4444),
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Σας ακούω... (χωρίς AI)",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFFEF4444)
+                                )
+                                Text(
+                                    text = if (voiceRecognizedText.isNotBlank())
+                                        "\"$voiceRecognizedText\""
+                                    else
+                                        "Πείτε όλη τη λίστα, π.χ. «γάλα, 2 ψωμιά, μήλα και φέτα»",
+                                    fontSize = 12.sp,
+                                    fontWeight = if (voiceRecognizedText.isNotBlank()) FontWeight.Bold else FontWeight.Normal,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            // Stop button
+                            IconButton(
+                                onClick = { stopVoiceListening() },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = "Τέλος",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1309,12 +1661,47 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
                 ) {
+                        // Option for Bulk Import via Text Paste / AI if adding new item
+                        if (editingItem == null) {
+                            OutlinedButton(
+                                onClick = {
+                                    showAddItemDialog = false
+                                    importDialogTab = 1
+                                    showAiScanDialog = true
+                                },
+                                modifier = Modifier.fillMaxWidth().testTag("bulk_paste_from_add_dialog_btn"),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = MaterialTheme.colorScheme.primary
+                                )
+                            ) {
+                                Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("📋 Μαζική Εισαγωγή με Επικόλληση / AI", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+
                         // Item Name
                         OutlinedTextField(
                             value = itemName,
                             onValueChange = { itemName = it },
                             label = { Text("Όνομα Προϊόντος") },
                             singleLine = true,
+                            trailingIcon = {
+                                IconButton(
+                                    onClick = {
+                                        startVoiceListening()
+                                        Toast.makeText(context, "Πείτε το προϊόν (π.χ. ψωμί ολικής)... 🎙️", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier.testTag("dialog_voice_input_btn")
+                                ) {
+                                    Icon(
+                                        imageVector = if (isVoiceRecording) Icons.Default.Mic else Icons.Default.MicNone,
+                                        contentDescription = "Φωνητική υπαγόρευση",
+                                        tint = if (isVoiceRecording) Color(0xFFEF4444) else MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                            },
                             modifier = Modifier.fillMaxWidth().testTag("item_name_input"),
                             placeholder = { Text("π.χ. Γιαούρτι Στραγγιστό") }
                         )
@@ -1976,7 +2363,7 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                         }
                     }
 
-                    // Ανάγνωση με AI (Magic Wand Scanner)
+                    // Ανάγνωση με AI & Επικόλληση Κειμένου
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1989,8 +2376,8 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Ανάγνωση με AI (Magic Wand) 🪄", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-                            Text("Ανίχνευση χειρόγραφης λίστας από φωτογραφία", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Εισαγωγή με AI & Επικόλληση 🪄📋", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                            Text("Ανίχνευση από φωτογραφία ή άμεση επικόλληση κειμένου", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         IconButton(
                             onClick = {
@@ -2321,7 +2708,7 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Ανάγνωση με AI 🪄",
+                            text = "Εισαγωγή Προϊόντων 🪄📋",
                             fontSize = 20.sp,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary
@@ -2340,93 +2727,24 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                         }
                     }
 
-                    Divider()
+                    // Mode Tab Selector
+                    var importModeTab by remember(importDialogTab) { mutableStateOf(importDialogTab) }
+                    var pastedTextInput by remember { mutableStateOf("") }
 
-                    Text(
-                        text = "Φωτογραφίστε τη χειρόγραφη λίστα σας ή επιλέξτε μια εικόνα. Το AI θα αναγνωρίσει τα προϊόντα αυτόματα!",
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center
-                    )
-
-                    // Image Picker / Preview Section
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(160.dp)
-                            .clickable {
-                                if (!isScanning) {
-                                    imagePickerLauncher.launch(
-                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                    )
-                                }
-                            },
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                        ),
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                    TabRow(
+                        selectedTabIndex = importModeTab,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
                     ) {
-                        if (selectedImageUri != null) {
-                            Box(modifier = Modifier.fillMaxSize()) {
-                                AsyncImage(
-                                    model = selectedImageUri,
-                                    contentDescription = "Selected Handwritten List Image",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                                // Dark overlay for text readability
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .background(Color.Black.copy(alpha = 0.4f))
-                                )
-                                Column(
-                                    modifier = Modifier
-                                        .align(Alignment.Center)
-                                        .padding(8.dp),
-                                    horizontalAlignment = Alignment.CenterHorizontally
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Refresh,
-                                        contentDescription = "Αλλαγή Εικόνας",
-                                        tint = Color.White
-                                    )
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        "Αλλαγή Εικόνας",
-                                        color = Color.White,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                        } else {
-                            Column(
-                                modifier = Modifier.fillMaxSize(),
-                                verticalArrangement = Arrangement.Center,
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.CameraAlt,
-                                    contentDescription = "Επιλογή Εικόνας",
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(36.dp)
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    "Επιλογή Εικόνας Λίστας",
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                Text(
-                                    "Κάντε κλικ για επιλογή",
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
+                        Tab(
+                            selected = importModeTab == 0,
+                            onClick = { if (!isScanning) importModeTab = 0 },
+                            text = { Text("📸 Φωτογραφία (AI)", fontSize = 12.sp, fontWeight = if (importModeTab == 0) FontWeight.Bold else FontWeight.Normal) }
+                        )
+                        Tab(
+                            selected = importModeTab == 1,
+                            onClick = { if (!isScanning) importModeTab = 1 },
+                            text = { Text("📋 Επικόλληση Κειμένου", fontSize = 12.sp, fontWeight = if (importModeTab == 1) FontWeight.Bold else FontWeight.Normal) }
+                        )
                     }
 
                     // Target List Selection
@@ -2434,26 +2752,27 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
                             text = "Προσθήκη στη λίστα:",
-                            fontSize = 13.sp,
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Box {
                             val targetList = lists.find { it.id == scanTargetListId.value }
-                            val targetListName = targetList?.name ?: "Επιλέξτε Λίστα..."
+                            val targetListName = targetList?.name ?: "Επιλέξτε..."
                             TextButton(
                                 onClick = { showTargetListDropdown = true },
-                                modifier = Modifier.testTag("scan_target_list_selector")
+                                modifier = Modifier.testTag("scan_target_list_selector"),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
                             ) {
-                                Text(targetListName, fontWeight = FontWeight.Bold)
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Icon(Icons.Default.ArrowDropDown, contentDescription = "Dropdown")
+                                Text(targetListName, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Icon(Icons.Default.ArrowDropDown, contentDescription = "Dropdown", modifier = Modifier.size(16.dp))
                             }
                             DropdownMenu(
                                 expanded = showTargetListDropdown,
@@ -2472,30 +2791,220 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                         }
                     }
 
-                    // Analysis Action Button
-                    Button(
-                        onClick = {
-                            val bmp = selectedImageBitmap
-                            if (bmp != null) {
-                                viewModel.scanHandwrittenList(bmp)
+                    // Tab 0: Image Picker / AI Scan
+                    if (importModeTab == 0) {
+                        Text(
+                            text = "Φωτογραφίστε τη χειρόγραφη λίστα σας ή επιλέξτε εικόνα. Το AI θα αναγνωρίσει τα προϊόντα αυτόματα!",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+
+                        // Image Picker / Preview Section
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(150.dp)
+                                .clickable {
+                                    if (!isScanning) {
+                                        imagePickerLauncher.launch(
+                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                        )
+                                    }
+                                },
+                            shape = RoundedCornerShape(16.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                            ),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+                        ) {
+                            if (selectedImageUri != null) {
+                                Box(modifier = Modifier.fillMaxSize()) {
+                                    AsyncImage(
+                                        model = selectedImageUri,
+                                        contentDescription = "Selected Handwritten List Image",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color.Black.copy(alpha = 0.4f))
+                                    )
+                                    Column(
+                                        modifier = Modifier
+                                            .align(Alignment.Center)
+                                            .padding(8.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Refresh,
+                                            contentDescription = "Αλλαγή Εικόνας",
+                                            tint = Color.White
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            "Αλλαγή Εικόνας",
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            } else {
+                                Column(
+                                    modifier = Modifier.fillMaxSize(),
+                                    verticalArrangement = Arrangement.Center,
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CameraAlt,
+                                        contentDescription = "Επιλογή Εικόνας",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(34.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text(
+                                        "Επιλογή Εικόνας Λίστας",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        "Κάντε κλικ για λήψη ή επιλογή",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
                             }
-                        },
-                        enabled = selectedImageBitmap != null && !isScanning,
-                        modifier = Modifier.fillMaxWidth().height(48.dp).testTag("start_ai_analysis_btn"),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        if (isScanning) {
-                            CircularProgressIndicator(
-                                color = MaterialTheme.colorScheme.onPrimary,
-                                strokeWidth = 2.dp,
-                                modifier = Modifier.size(20.dp)
+                        }
+
+                        // Analysis Action Button
+                        Button(
+                            onClick = {
+                                val bmp = selectedImageBitmap
+                                if (bmp != null) {
+                                    viewModel.scanHandwrittenList(bmp)
+                                }
+                            },
+                            enabled = selectedImageBitmap != null && !isScanning,
+                            modifier = Modifier.fillMaxWidth().height(48.dp).testTag("start_ai_analysis_btn"),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            if (isScanning) {
+                                CircularProgressIndicator(
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                    strokeWidth = 2.dp,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Ανάλυση σε εξέλιξη... 🪄")
+                            } else {
+                                Icon(Icons.Default.AutoFixHigh, contentDescription = "Analyze")
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Ανάλυση με AI ✨", fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    } else {
+                        // Tab 1: Text Paste Import
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Επικολλήστε κείμενο λίστας:",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    TextButton(
+                                        onClick = {
+                                            val clip = clipboardManager.getText()?.text
+                                            if (!clip.isNullOrBlank()) {
+                                                pastedTextInput = clip
+                                            } else {
+                                                Toast.makeText(context, "Το πρόχειρο είναι άδειο", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                        modifier = Modifier.height(28.dp).testTag("paste_clipboard_btn")
+                                    ) {
+                                        Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(13.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Επικόλληση", fontSize = 11.sp)
+                                    }
+                                    if (pastedTextInput.isNotBlank()) {
+                                        TextButton(
+                                            onClick = { pastedTextInput = "" },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                            modifier = Modifier.height(28.dp)
+                                        ) {
+                                            Text("Καθαρισμός", fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+                                        }
+                                    }
+                                }
+                            }
+
+                            OutlinedTextField(
+                                value = pastedTextInput,
+                                onValueChange = { pastedTextInput = it },
+                                placeholder = {
+                                    Text(
+                                        "π.χ.\n2 γάλα\nψωμί τοστ\n1.5 κιλό πατάτες\nφέτα 500γρ\nαυγά 6αδα\nμήλα",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                    )
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 110.dp, max = 180.dp)
+                                    .testTag("pasted_text_field"),
+                                shape = RoundedCornerShape(12.dp)
                             )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Ανάλυση σε εξέλιξη... 🪄")
-                        } else {
-                            Icon(Icons.Default.AutoFixHigh, contentDescription = "Analyze")
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Ανάλυση με AI ✨", fontWeight = FontWeight.Bold)
+
+                            // Action buttons for Text Import
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                // 1. Direct local parsing (instant, offline, 100% immune to 429)
+                                Button(
+                                    onClick = {
+                                        viewModel.importFromPastedText(pastedTextInput, useAi = false)
+                                    },
+                                    enabled = pastedTextInput.isNotBlank() && !isScanning,
+                                    modifier = Modifier.weight(1f).height(44.dp).testTag("direct_text_import_btn"),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Άμεση Εισαγωγή ⚡", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                }
+
+                                // 2. AI-assisted parsing
+                                OutlinedButton(
+                                    onClick = {
+                                        viewModel.importFromPastedText(pastedTextInput, useAi = true)
+                                    },
+                                    enabled = pastedTextInput.isNotBlank() && !isScanning,
+                                    modifier = Modifier.weight(1f).height(44.dp).testTag("ai_text_import_btn"),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    if (isScanning) {
+                                        CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                                    } else {
+                                        Icon(Icons.Default.AutoFixHigh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Ανάλυση AI ✨", fontSize = 11.sp)
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -2506,18 +3015,30 @@ fun DashboardScreen(viewModel: BentoViewModel) {
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Row(
+                            Column(
                                 modifier = Modifier.padding(12.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                Icon(Icons.Default.Warning, contentDescription = "Error", tint = MaterialTheme.colorScheme.error)
-                                Text(
-                                    text = scanError ?: "",
-                                    color = MaterialTheme.colorScheme.onErrorContainer,
-                                    fontSize = 12.sp,
-                                    modifier = Modifier.weight(1f)
-                                )
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.Warning, contentDescription = "Error", tint = MaterialTheme.colorScheme.error)
+                                    Text(
+                                        text = scanError ?: "",
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                                if (importModeTab == 0 && (scanError?.contains("429") == true || scanError?.contains("Rate Limit") == true)) {
+                                    TextButton(
+                                        onClick = { importModeTab = 1 },
+                                        modifier = Modifier.align(Alignment.End).height(30.dp)
+                                    ) {
+                                        Text("👉 Μετάβαση στην Επικόλληση Κειμένου", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
                             }
                         }
                     }
